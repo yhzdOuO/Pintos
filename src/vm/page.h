@@ -61,12 +61,5 @@ void spt_remove_spte(struct spt *spt, void *upage);
 bool spt_has_page(struct spt *spt, void *upage);
 bool spt_is_valid_page(struct spt *spt, void *upage, bool writable);
 bool spt_claim_page(struct spt *spt, void *upage);
-bool spt_hold_page(struct spt *spt, void *upage);
-void spt_release_page(struct spt *spt, void *upage);
-
-bool spt_is_valid_range(struct spt *spt, void *start, size_t size, bool writable);
-bool spt_claim_range(struct spt *spt, void *start, size_t size); // 没用到
-bool spt_hold_range(struct spt *spt, void *start, size_t size);
-void spt_release_range(struct spt *spt, void *start, size_t size);
 
 #endif /* vm/page.h */

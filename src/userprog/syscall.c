@@ -27,8 +27,6 @@ struct file_desc
 
 static void syscall_handler (struct intr_frame *);
 static void kill_process (void) NO_RETURN;
-// static void check_uaddr_range (const void *uaddr, size_t size, bool writable);
-// static size_t check_cstring (const char *uaddr);
 static uint32_t fetch_u32 (const void *uaddr);
 static size_t copy_from_user(void *kdst, const void *usrc, size_t size);
 static size_t copy_to_user(void *udst, const void *ksrc, size_t size);
@@ -255,82 +253,6 @@ copy_string_from_user(char *kdst, const char *usrc, size_t max_len)
   return result;
 }
 
-/* ----------------------------- */
-
-
-// static void
-// check_uaddr_range (const void *uaddr, size_t size, bool writable)
-// {
-//   uintptr_t start = (uintptr_t) uaddr;
-//   uintptr_t end;
-//   struct thread *cur = thread_current ();
-
-//   if (size == 0)
-//     return;
-//   if (start == 0)
-//     kill_process ();
-
-//   end = start + size - 1;
-//   if (end < start
-//       || !is_user_vaddr ((const void *) start)
-//       || !is_user_vaddr ((const void *) end))
-//     kill_process ();
-
-//   if (!spt_is_valid_range (cur->spt, (void *) start, size, writable))
-//     kill_process ();
-// }
-
-// static void
-// hold_uaddr_range(const void *uaddr, size_t size) 
-// {
-//   syscall_filesys_lock ();
-//   if (!spt_hold_range (thread_current ()->spt, (void *) uaddr, size)) {
-//     syscall_filesys_unlock ();
-//     kill_process ();
-//   }
-//   syscall_filesys_unlock ();
-// }
-
-// static void 
-// release_uaddr_range(const void *uaddr, size_t size) 
-// {
-//   spt_release_range (thread_current ()->spt, (void *) uaddr, size);
-// }
-
-// static size_t
-// check_cstring (const char *uaddr)
-// {
-//   size_t len = 0;
-
-//   if (uaddr == NULL)
-//     kill_process ();
-
-  
-//   while (true)
-//     {
-//       char *page_end = (char *) pg_round_up (uaddr + 1);
-//       size_t page_left = page_end - (char *) uaddr;
-//       size_t offset = 0;
-//       check_uaddr_range (uaddr, page_left, false);
-//       hold_uaddr_range (uaddr, page_left);
-//       while (page_left-- > 0)
-//         {
-//           if (uaddr[offset] == '\0') {
-//             release_uaddr_range (uaddr, offset + 1);
-//             return len;
-//           }
-//           len++;
-//           offset++;
-//           if (len >= PGSIZE) {
-//             release_uaddr_range (uaddr, offset);
-//             kill_process ();
-//           }
-//         }
-//       release_uaddr_range (uaddr, offset);
-//       uaddr += offset;
-//     }
-// }
-
 static uint32_t
 fetch_u32 (const void *uaddr)
 {
@@ -340,11 +262,6 @@ fetch_u32 (const void *uaddr)
     kill_process ();
   }
   return result;
-  // check_uaddr_range (uaddr, sizeof (uint32_t), false);
-  // hold_uaddr_range (uaddr, sizeof (uint32_t));
-  // uint32_t value = *(const uint32_t *) uaddr;
-  // release_uaddr_range (uaddr, sizeof (uint32_t));
-  // return value;
 }
 
 static struct file_desc *
@@ -403,17 +320,6 @@ sys_create (const char *file_name, unsigned initial_size)
 
   palloc_free_page (kfile_name);
   return ok;
-
-  // bool ok;
-
-  // size_t len = check_cstring (file_name);
-  // hold_uaddr_range (file_name, len + 1);
-
-  // syscall_filesys_lock ();
-  // ok = filesys_create (file_name, (off_t) initial_size);
-  // syscall_filesys_unlock ();
-  // release_uaddr_range (file_name, len + 1);
-  // return ok;
 }
 
 static bool
@@ -434,17 +340,6 @@ sys_remove (const char *file_name)
   
   palloc_free_page (kfile_name);
   return ok;
-
-  // bool ok;
-
-  // size_t len = check_cstring (file_name);
-  // hold_uaddr_range (file_name, len + 1);
-
-  // syscall_filesys_lock ();
-  // ok = filesys_remove (file_name);
-  // syscall_filesys_unlock ();
-  // release_uaddr_range (file_name, len + 1);
-  // return ok;
 }
 
 static tid_t
@@ -461,22 +356,6 @@ sys_exec (const char *cmd_line)
   tid_t tid = process_execute (kcmd);
   palloc_free_page (kcmd);
   return tid;
-
-  // size_t len = check_cstring (cmd_line);
-  // hold_uaddr_range (cmd_line, len + 1);
-  // char *kcmd = palloc_get_page (0);
-  // tid_t tid;
-
-  // if (kcmd == NULL) {
-  //   release_uaddr_range (cmd_line, len + 1);
-  //   return TID_ERROR;
-  // }
-  // memcpy (kcmd, cmd_line, len + 1);
-  // release_uaddr_range (cmd_line, len + 1);
-
-  // tid = process_execute (kcmd);
-  // palloc_free_page (kcmd);
-  // return tid;
 }
 
 static int
@@ -505,26 +384,6 @@ sys_open (const char *file_name)
   }
   palloc_free_page (kfile_name);
   return fd;
-
-  // struct file *file;
-  // int fd;
-
-  // size_t len = check_cstring (file_name);
-  // hold_uaddr_range (file_name, len + 1);
-  // syscall_filesys_lock ();
-  // file = filesys_open (file_name);
-  // if (file == NULL)
-  //   {
-  //     syscall_filesys_unlock ();
-  //     release_uaddr_range (file_name, len + 1);
-  //     return -1;
-  //   }
-  // fd = fd_insert (file);
-  // if (fd == -1)
-  //   file_close (file);
-  // syscall_filesys_unlock ();
-  // release_uaddr_range (file_name, len + 1);
-  // return fd;
 }
 
 static int
@@ -594,32 +453,6 @@ sys_read (int fd, void *buffer, unsigned size)
   }
   palloc_free_page (kbuffer);
   return (int) read_bytes;
-
-  // uint8_t *dst = buffer;
-
-  // check_uaddr_range (buffer, size, true);
-  // hold_uaddr_range (buffer, size);
-
-  // int read_bytes = -1;
-  // if (fd == 0)
-  //   {
-  //     unsigned i;
-  //     for (i = 0; i < size; i++)
-  //       dst[i] = input_getc ();
-  //     read_bytes = size;
-  //   }
-  // else
-  //   {
-  //     struct file_desc *desc = fd_lookup (fd);
-  //     if (desc != NULL)
-  //       {
-  //         syscall_filesys_lock ();
-  //         read_bytes = (int) file_read (desc->file, buffer, (off_t) size);
-  //         syscall_filesys_unlock ();
-  //       }
-  //   }
-  // release_uaddr_range (buffer, size);
-  // return read_bytes;
 }
 
 static void
@@ -688,43 +521,6 @@ sys_write (int fd, const void *buffer, unsigned size)
 
   palloc_free_page (kbuffer);
   return (int) written_bytes;
-
-  // const uint8_t *src = buffer;
-  // struct file_desc *desc;
-
-  // if (fd == 0)
-  //   return -1;
-
-  // check_uaddr_range (buffer, size, false);
-  // hold_uaddr_range (buffer, size);
-
-  // int written_bytes = -1;
-  // if (fd == 1)
-  //   {
-  //     unsigned remaining = size;
-
-  //     while (remaining > 0)
-  //       {
-  //         uint8_t kbuf[256];
-  //         unsigned chunk = remaining < sizeof kbuf ? remaining : sizeof kbuf;
-  //         memcpy (kbuf, src, chunk);
-  //         putbuf ((const char *) kbuf, chunk);
-  //         src += chunk;
-  //         remaining -= chunk;
-  //       }
-  //     written_bytes = (int) size;
-  //   }
-  // else 
-  //   {
-  //     desc = fd_lookup (fd);
-  //     if (desc != NULL) {
-  //       syscall_filesys_lock ();
-  //       written_bytes = (int) file_write (desc->file, buffer, (off_t) size);
-  //       syscall_filesys_unlock ();
-  //     }
-  //   }
-  // release_uaddr_range (buffer, size);
-  // return written_bytes;
 }
 
 static void
