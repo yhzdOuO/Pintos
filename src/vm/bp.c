@@ -145,23 +145,29 @@ bp_detach(struct backing_page *bp, struct spte *spte) {
     bp_clear_spte_page(spte); 
     list_remove(&spte->bp_elem);
     lock_release(&bp->lock);
-    
+
+    bool should_free_bp = false;
     if (bp->origin == BP_ORIGIN_FILE && bp->sharing == BP_SHARED) {
         lock_acquire(&shared_file_bps.lock);
         bp->file_ref_cnt--;
-        if(bp->file_ref_cnt == 0) {
+        if (bp->file_ref_cnt == 0) {
             hash_delete(&shared_file_bps.file_bps, &bp->cache_elem);
-            lock_release(&shared_file_bps.lock);
-            /* delete bp */
-            // 需要和frame同步
-            lock_acquire(&bp->lock);
-            bp_write_back_locked(bp);
-            lock_release(&bp->lock);
-            free(bp);
+            should_free_bp = true;
         }
-        else {
-            lock_release(&shared_file_bps.lock);
+        lock_release(&shared_file_bps.lock);
+    }
+    else {
+        bp->file_ref_cnt--;
+        if (bp->file_ref_cnt == 0) {
+            should_free_bp = true;
         }
+    }
+
+    if (should_free_bp) {
+        lock_acquire(&bp->lock);
+        bp_write_back_locked(bp);
+        lock_release(&bp->lock);
+        free(bp);
     }
 }
 
@@ -178,12 +184,7 @@ file_source_less_func(const struct hash_elem *a, const struct hash_elem *b,
     const struct backing_page *bp_b = hash_entry(b, struct backing_page, cache_elem);
     const struct file_info *fi_a = &bp_a->origin_info.file;
     const struct file_info *fi_b = &bp_b->origin_info.file;
-    if (fi_a->file != fi_b->file) {
-        return fi_a->file < fi_b->file;
-    }
-    else {
-        return fi_a->offset < fi_b->offset;
-    }
+    return hash_bytes(fi_a, sizeof(*fi_a)) < hash_bytes(fi_b, sizeof(*fi_b));
 }
 
 static bool 
@@ -389,11 +390,11 @@ bool bp_claim_page(struct backing_page *bp, struct spte *spte) {
 bool 
 bp_collect_accessed_locked(struct backing_page *bp, bool clear) {
     struct list_elem *e;
+    bool accessed = bp->accessed;
      for (e = list_begin(&bp->sharers); e != list_end(&bp->sharers); e = list_next(e)) {
         struct spte *spte = list_entry(e, struct spte, bp_elem);
-        bp_test_spte_accessed(spte, clear);
+        accessed |= bp_test_spte_accessed(spte, clear);
     }
-    bool accessed = bp->accessed;
     bp->accessed = clear ? false : bp->accessed; 
     return accessed;
 }
@@ -401,11 +402,11 @@ bp_collect_accessed_locked(struct backing_page *bp, bool clear) {
 bool 
 bp_collect_dirty_locked(struct backing_page *bp, bool clear) {
     struct list_elem *e;
+    bool dirty = bp->dirty;
     for (e = list_begin(&bp->sharers); e != list_end(&bp->sharers); e = list_next(e)) {
         struct spte *spte = list_entry(e, struct spte, bp_elem);
-        bp_test_spte_dirty(spte, clear); 
+        dirty |= bp_test_spte_dirty(spte, clear); 
     }
-    bool dirty = bp->dirty;
     bp->dirty = clear ? false : bp->dirty;
     return dirty;
 }

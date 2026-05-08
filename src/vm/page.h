@@ -18,6 +18,7 @@ struct spte {
     void *upage;                  // 用户虚页
     bool writable;                // 该映射是否允许写
     struct backing_page *bp;      // 页内容对象
+    bool cow;
 
     //struct mmap_entry *mmap;       // 属于某次 mmap；否则为 NULL
     struct spt *owner;            // 所属地址空间

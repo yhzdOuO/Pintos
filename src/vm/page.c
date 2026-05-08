@@ -30,6 +30,9 @@ spt_insert_spte(struct spt *spt, struct spte_desc *desc) {
     }
     spte->upage = desc->upage;
     spte->writable = desc->writable;
+    spte->cow = desc->writable 
+                && desc->kind == SPTE_FILE 
+                && desc->sharing == SPTE_PRIVATE;
     spte->owner = NULL;
     spte->bp = NULL;
     
