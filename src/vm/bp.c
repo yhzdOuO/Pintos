@@ -385,24 +385,6 @@ bool bp_claim_page(struct backing_page *bp, struct spte *spte) {
     return success;
 }
 
-bool
-bp_pin_page(struct backing_page *bp, struct spte *spte) {
-    lock_acquire(&bp->lock);
-    bool success = bp_claim_locked(bp, spte); // claim page to make sure the page is resident, if failed, the page won't be pinned but it doesn't matter because the caller will also fail to access the page
-    if (success) {
-        frame_pin(bp->frame);
-    }
-    lock_release(&bp->lock);
-    return success;
-}
-
-void
-bp_unpin_page(struct backing_page *bp) {
-    lock_acquire(&bp->lock);
-    ASSERT(bp->status == BP_LOADED);
-    frame_unpin(bp->frame);
-    lock_release(&bp->lock);
-}
 /* ----------- bp访问sharers的页表 ----------- */
 bool 
 bp_collect_accessed_locked(struct backing_page *bp, bool clear) {

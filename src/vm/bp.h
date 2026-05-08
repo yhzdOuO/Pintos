@@ -79,8 +79,6 @@ struct backing_page *bp_get_anon(struct spte_desc *desc);
 void bp_attach(struct backing_page *bp, struct spte *spte);
 void bp_detach(struct backing_page *bp, struct spte *spte);
 bool bp_claim_page(struct backing_page *bp, struct spte *spte); 
-bool bp_pin_page(struct backing_page *bp, struct spte *spte);
-void bp_unpin_page(struct backing_page *bp);
 
 // used by frame.c
 bool bp_evict_locked(struct backing_page *bp);
