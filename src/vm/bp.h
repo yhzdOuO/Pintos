@@ -60,7 +60,7 @@ struct backing_page {
 
     union {
         struct file_info{
-            struct file *file;
+            struct inode *inode_ptr;
             off_t offset;
             off_t read_bytes;
             off_t zero_bytes;

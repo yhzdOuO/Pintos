@@ -8,6 +8,8 @@
 #include "vm/page.h"
 #include "vm/frame.h"
 #include "vm/swap.h"
+#include "filesys/inode.h"
+#include "filesys/file.h"
 
 /******************** bp functions ********************/
 static struct shared_backing_page {
@@ -51,7 +53,7 @@ bp_init_file(struct backing_page *bp, struct spte_desc *desc) {
         bp->origin = BP_ORIGIN_FILE;
         bp->store = BP_STORE_SWAP; // private file page 需要被换出到
     }
-    bp->origin_info.file.file = desc->file;
+    bp->origin_info.file.inode_ptr = file_get_inode(desc->file);
     bp->origin_info.file.offset = desc->offset;
     bp->origin_info.file.read_bytes = desc->read_bytes;
     bp->origin_info.file.zero_bytes = desc->zero_bytes;
@@ -184,7 +186,16 @@ file_source_less_func(const struct hash_elem *a, const struct hash_elem *b,
     const struct backing_page *bp_b = hash_entry(b, struct backing_page, cache_elem);
     const struct file_info *fi_a = &bp_a->origin_info.file;
     const struct file_info *fi_b = &bp_b->origin_info.file;
-    return hash_bytes(fi_a, sizeof(*fi_a)) < hash_bytes(fi_b, sizeof(*fi_b));
+    if (fi_a->inode_ptr != fi_b->inode_ptr) {
+        return fi_a->inode_ptr < fi_b->inode_ptr;
+    }
+    if (fi_a->offset != fi_b->offset) {
+        return fi_a->offset < fi_b->offset;
+    }
+    if (fi_a->read_bytes != fi_b->read_bytes) {
+        return fi_a->read_bytes < fi_b->read_bytes;
+    }
+    return fi_a->zero_bytes < fi_b->zero_bytes;
 }
 
 static bool 
@@ -194,7 +205,7 @@ bp_page_in(struct backing_page *bp, struct frame *f) {
         || (bp->status == BP_EVICTED && bp->store == BP_STORE_FILE)) {
         lock_release(&bp->lock);
         const struct file_info *fi = &bp->origin_info.file;
-        off_t read_byte = file_read_at(fi->file, f->kpage, 
+        off_t read_byte = inode_read_at(fi->inode_ptr, f->kpage, 
                                     fi->read_bytes, fi->offset);
         memset(f->kpage + fi->read_bytes, 0, fi->zero_bytes);
         return read_byte == fi->read_bytes;
@@ -229,7 +240,7 @@ bp_write_back_locked(struct backing_page *bp) {
                 const struct file_info *fi = &bp->origin_info.file;
                 void *kpage = bp->frame->kpage;
                 lock_release(&bp->lock);
-                off_t written_bytes = file_write_at(fi->file, kpage, 
+                off_t written_bytes = inode_write_at(fi->inode_ptr, kpage, 
                                                     fi->read_bytes, fi->offset);
                 if (written_bytes != fi->read_bytes) {
                     PANIC("Failed to write back dirty page to file during bp_free. \n"
@@ -275,7 +286,7 @@ bp_evict_locked(struct backing_page *bp) {
             void *kpage = bp->frame->kpage;
             lock_release(&bp->lock);
             const struct file_info *fi = &bp->origin_info.file;
-            off_t written_bytes = file_write_at(fi->file, kpage, 
+            off_t written_bytes = inode_write_at(fi->inode_ptr, kpage, 
                                                 fi->read_bytes, fi->offset);
             success = written_bytes == fi->read_bytes;
             lock_acquire(&bp->lock);
