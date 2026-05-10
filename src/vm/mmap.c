@@ -49,7 +49,7 @@ mmap_table_map(struct mmap_table *mmap_table, struct file *file, void *addr) {
     return -1;
   }
 
-  file = file_reopen(file);
+  file = file_reopen(file); // 重新打开一份，由自己管理，避免被程序关闭而导致无法写回
   if (file == NULL) {
     return -1;
   }

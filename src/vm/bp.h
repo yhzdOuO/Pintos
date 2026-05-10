@@ -11,45 +11,29 @@
 struct spte;
 struct spte_desc;
 
-enum bp_origin_fin {
-    BP_ORIGIN_FILE,
-    BP_ORIGIN_ANON,
+enum bp_kind {
+    BP_KIND_FILE,
+    BP_KIND_ANON,
 };
 
-enum bp_store_fin {
-    BP_STORE_FILE,   // 不在内存时，从 origin 重建
-    BP_STORE_SWAP      // 不在内存时，从 swap 重建
-};
-
-enum bp_sharing_fin {
-    BP_PRIVATE,
-    BP_SHARED,
-};
-
-enum bp_busy {
-    BP_NOT_BUSY,
-    BP_BUSY,
-};
-
-enum bp_status {
-    BP_NOT_LOADED,
-    BP_LOADED,
-    BP_EVICTED,   // 已经被换出，但还没有被访问到，所以还没有被加载回来
-    BP_FAILED,   // 仅在加载过程中发生错误时使用，表示该页无法使用了
+enum bp_location {
+    BP_LOC_FILE,
+    BP_LOC_ZERO,
+    BP_LOC_SWAP,
+    BP_LOC_FRAME, // 可以改名为resident
 };
 
 struct backing_page {
-    enum bp_origin_fin origin;        // 原始来源：file / anon
-    enum bp_store_fin store;          // 若非 resident，当前应从哪恢复
-    enum bp_sharing_fin sharing;      // shared / private 
+    enum bp_kind kind;
+    enum bp_location loc;
 
+    bool shared;
+    bool busy;
     bool accessed, dirty;           // 由 clock 算法使用，访问过但未被换出的页不应该被换出
 
     struct lock lock;             // 保护 frame/status/store/sharers
     struct list sharers;          // list of struct spte
-    enum bp_busy busy;            // 阻止修改status
     struct condition busy_cond;   // 加载完成的条件变量，保护 load_status
-    enum bp_status status;        // loading / loaded / evicting
 
     struct frame *frame;          // 若 resident，则非 NULL
     swap_slot_t slot;             // 仅 store == BP_STORE_SWAP 时有效

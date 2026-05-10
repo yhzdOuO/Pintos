@@ -138,7 +138,7 @@ clock_try_evict(struct frame *f, bool clock_first_time) {
     struct backing_page *bp = f->bp;
     ASSERT(bp != NULL);
     lock_acquire(&bp->lock);
-    if (bp->busy == BP_BUSY) {
+    if (bp->busy) {
         lock_release(&bp->lock);
         return false;
     }

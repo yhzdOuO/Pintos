@@ -42,7 +42,7 @@ pmap_test_spte_dirty(struct spte *spte, bool clear) {
 }
 
 bool
-pmap_is_mmaped(struct spte *spte) {
+pmap_check_spte_mmaped(struct spte *spte) {
     uint32_t *pagedir = pmap_get_spte_pagedir(spte);
     return pagedir_get_page(pagedir, spte->upage) != NULL;
 }

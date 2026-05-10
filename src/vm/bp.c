@@ -28,6 +28,8 @@ static void bp_clear_pages_locked(struct backing_page *bp);
 
 // 实际上private+COW也算是一种共享
 
+
+
 void 
 backing_page_init(void) {
     lock_init(&shared_file_bps.lock);
@@ -36,50 +38,44 @@ backing_page_init(void) {
 
 static void
 bp_init_file(struct backing_page *bp, struct spte_desc *desc) {
-    if (desc->sharing == SPTE_SHARED) {
-        bp->sharing = BP_SHARED;
-        bp->origin = BP_ORIGIN_FILE;
-        bp->store = BP_STORE_FILE;
-    }
-    else if (desc->sharing == SPTE_PRIVATE) {
-        bp->sharing = BP_PRIVATE;
-        bp->origin = BP_ORIGIN_FILE;
-        bp->store = BP_STORE_SWAP; // private file page 需要被换出到
-    }
+    bp->kind = BP_KIND_FILE;
+    bp->loc = BP_LOC_FILE;
+
+    bp->shared = (desc->sharing == SPTE_SHARED);
+    bp->busy = false;
+    bp->accessed = bp->dirty = false;
+
+    lock_init(&bp->lock);
+    list_init(&bp->sharers);
+    cond_init(&bp->busy_cond);
+
+    bp->frame = NULL;
+    bp->slot = SLOT_ERROR;
+
+    bp->file_ref_cnt = 1;
+
     bp->origin_info.file.inode_ptr = file_get_inode(desc->file);
     bp->origin_info.file.offset = desc->offset;
     bp->origin_info.file.read_bytes = desc->read_bytes;
     bp->origin_info.file.zero_bytes = desc->zero_bytes;
-
-    bp->accessed = bp->dirty = false;
-    lock_init(&bp->lock);
-    list_init(&bp->sharers);
-    bp->busy = BP_NOT_BUSY;
-    cond_init(&bp->busy_cond);
-    bp->status = BP_NOT_LOADED;
-    bp->frame = NULL;
-    bp->slot = SLOT_ERROR;
-    bp->file_ref_cnt = 1;
 }
 
 static void 
 bp_init_zero(struct backing_page *bp, struct spte_desc *desc) {
-    bp->origin = BP_ORIGIN_ANON;
-    bp->store = BP_STORE_SWAP; // anon page 需要被换出到swap
-    if (desc->sharing == SPTE_SHARED) {
-        bp->sharing = BP_SHARED;
-    }
-    else if (desc->sharing == SPTE_PRIVATE) {
-        bp->sharing = BP_PRIVATE;
-    }
+    bp->kind = BP_KIND_ANON;
+    bp->loc = BP_LOC_ZERO;
+
+    bp->shared = false;
+    bp->busy = false;
     bp->accessed = bp->dirty = false;
+    
     lock_init(&bp->lock);
     list_init(&bp->sharers);
-    bp->busy = BP_NOT_BUSY;
     cond_init(&bp->busy_cond);
-    bp->status = BP_NOT_LOADED;
+    
     bp->frame = NULL;
     bp->slot = SLOT_ERROR;
+    
     bp->file_ref_cnt = 1;
 }
 
@@ -92,8 +88,7 @@ bp_get_file(struct spte_desc *desc) {
     
     bp_init_file(bp, desc);
 
-    // 支持COW以后，无论是否标记为SHARED都可以共享
-    if (bp->sharing == BP_SHARED) {
+    if (bp->shared) {
         lock_acquire(&shared_file_bps.lock);
         // 先查全局共享缓存
         struct hash_elem *e = hash_find(&shared_file_bps.file_bps, &bp->cache_elem);
@@ -142,7 +137,7 @@ bp_detach(struct backing_page *bp, struct spte *spte) {
     lock_release(&bp->lock);
 
     bool should_free_bp = false;
-    if (bp->origin == BP_ORIGIN_FILE && bp->sharing == BP_SHARED) {
+    if (bp->kind == BP_KIND_FILE && bp->shared) {
         lock_acquire(&shared_file_bps.lock);
         bp->file_ref_cnt--;
         if (bp->file_ref_cnt == 0) {
@@ -194,8 +189,7 @@ file_source_less_func(const struct hash_elem *a, const struct hash_elem *b,
 static bool 
 bp_page_in(struct backing_page *bp, struct frame *f) {
     lock_acquire(&bp->lock);
-    if ((bp->status == BP_NOT_LOADED && bp->origin == BP_ORIGIN_FILE)
-        || (bp->status == BP_EVICTED && bp->store == BP_STORE_FILE)) {
+    if (bp->loc == BP_LOC_FILE) {
         lock_release(&bp->lock);
         const struct file_info *fi = &bp->origin_info.file;
         off_t read_byte = inode_read_at(fi->inode_ptr, f->kpage, 
@@ -203,32 +197,33 @@ bp_page_in(struct backing_page *bp, struct frame *f) {
         memset(f->kpage + fi->read_bytes, 0, fi->zero_bytes);
         return read_byte == fi->read_bytes;
     }
-    else if (bp->status == BP_EVICTED && bp->store == BP_STORE_SWAP) {
+    else if (bp->loc == BP_LOC_SWAP) {
         swap_slot_t slot = bp->slot;
         lock_release(&bp->lock);
         swap_read_page(slot, f->kpage);
         swap_free_slot(slot);
         return true;
     }
-    else if (bp->status == BP_NOT_LOADED && bp->origin == BP_ORIGIN_ANON) {
+    else if (bp->loc == BP_LOC_ZERO) {
         lock_release(&bp->lock);
         memset(f->kpage, 0, PGSIZE);
         return true;
     }
     else {
         lock_release(&bp->lock);
-        PANIC("Invalid bp status or origin in bp_page_in. Status: %d, Origin: %d", bp->status, bp->origin);
+        PANIC("Invalid bp location in bp_page_in: %d", bp->loc);
     }
 }
 
 static void 
 bp_write_back_locked(struct backing_page *bp) {
-    while(bp->busy == BP_BUSY) {
+    while(bp->busy) {
         cond_wait(&bp->busy_cond, &bp->lock);
     }
-    bp->busy = BP_BUSY; // 保持busy直到free，防止frame的访问（frame不访问busy状态的bp）
-    if (bp->status == BP_LOADED) {
-        if (bp->store == BP_STORE_FILE) {
+    bp->busy = true; // 保持busy直到free，防止frame的访问（frame不访问busy状态的bp）
+    
+    if (bp->loc == BP_LOC_FRAME) {
+        if (bp->kind == BP_KIND_FILE) {
             if (bp_collect_dirty_locked(bp, false)) {
                 const struct file_info *fi = &bp->origin_info.file;
                 void *kpage = bp->frame->kpage;
@@ -242,21 +237,22 @@ bp_write_back_locked(struct backing_page *bp) {
                 lock_acquire(&bp->lock);
             }
         }
+        else if (bp->kind == BP_KIND_ANON) {
+            // 不做任何事
+        }
         lock_release(&bp->lock);
         frame_free(bp->frame);
         lock_acquire(&bp->lock);
         bp->frame = NULL;
     }
-    else if (bp->status == BP_EVICTED) {
-        if (bp->store == BP_STORE_SWAP) {
-            lock_release(&bp->lock);
-            swap_free_slot(bp->slot);
-            lock_acquire(&bp->lock);
-            bp->slot = SLOT_ERROR;
-        }
+    else if (bp->loc == BP_LOC_SWAP) {
+        lock_release(&bp->lock);
+        swap_free_slot(bp->slot);
+        lock_acquire(&bp->lock);
+        bp->slot = SLOT_ERROR;
     }
-    else if (bp->status == BP_NOT_LOADED) {
-        // 没有加载到内存过，不需要写回
+    else if (bp->loc == BP_LOC_ZERO || bp->loc == BP_LOC_FILE) {
+        // 没有加载到内存，不需要做任何事
     }
 }
 
@@ -265,13 +261,13 @@ bp_write_back_locked(struct backing_page *bp) {
 // 也不会加载和逐出同时发生，因为frame分配的页会先pin住，等装载完再unpin，不会装载的时候被逐出
 bool 
 bp_evict_locked(struct backing_page *bp) {
-    ASSERT(bp->status == BP_LOADED); // 只有加载完成的页才会被逐出
-    ASSERT(bp->busy == BP_NOT_BUSY); // 逐出前应该没有线程在加载这个页了
-    bp->busy = BP_BUSY;
+    ASSERT(bp->loc == BP_LOC_FRAME); // 只有加载完成的页才会被逐出
+    ASSERT(!bp->busy); // 逐出前应该没有线程在加载这个页了
+    bp->busy = true;
 
     bool success = false;
     // start evicting the page
-    if (bp->store == BP_STORE_FILE) {
+    if (bp->kind == BP_KIND_FILE) {
         if (!bp_collect_dirty_locked(bp, false)) {
             success = true; // 没有被修改过，不需要写回，直接当作写回成功了
         }
@@ -284,8 +280,12 @@ bp_evict_locked(struct backing_page *bp) {
             success = written_bytes == fi->read_bytes;
             lock_acquire(&bp->lock);
         }
+        if (success) {
+            bp->loc = BP_LOC_FILE;
+            // 不用清理，因为全部重置了
+        }
     }
-    else if (bp->store == BP_STORE_SWAP) {
+    else if (bp->kind == BP_KIND_ANON) {
         lock_release(&bp->lock);
         swap_slot_t slot = swap_alloc_slot();
         success = slot != SLOT_ERROR;
@@ -295,40 +295,37 @@ bp_evict_locked(struct backing_page *bp) {
         lock_acquire(&bp->lock);
         if (success) {
             bp->slot = slot;
+            bp->loc = BP_LOC_SWAP;
         }
     }
     else {
-        PANIC("Invalid bp store type in bp_evict: %d", bp->store);
+        PANIC("Invalid bp kind in bp_evict: %d", bp->kind);
     }
     // evicting done, update bp status
 
     if (success) {
-        bp->status = BP_EVICTED;
         bp->frame = NULL;
-        bp_clear_pages_locked(bp); // 同步页表
+        bp_clear_pages_locked(bp); // 同步页表，同时也清除页表的A和D位
+        bp->accessed = bp->dirty = false; // 重置访问和修改状态
     }
-    bp->busy = BP_NOT_BUSY;
+    bp->busy = false;
     cond_broadcast(&bp->busy_cond, &bp->lock);
     return success;
 }
 
 static bool 
 bp_load_locked(struct backing_page *bp) {
-    while (bp->busy == BP_BUSY) {
+    while (bp->busy) {
         cond_wait(&bp->busy_cond, &bp->lock);
     }
 
-    if (bp->status == BP_FAILED) {
-        // 之前加载过了，但加载失败了，说明这个页是不可用的了
-        return false;
-    }
-    else if (bp->status == BP_LOADED) {
+    if (bp->loc == BP_LOC_FRAME) {
         // 已经加载过
         return true;
     }
-    else if (bp->status == BP_NOT_LOADED || bp->status == BP_EVICTED) {
+    else if (bp->loc == BP_LOC_FILE || bp->loc == BP_LOC_SWAP || bp->loc == BP_LOC_ZERO) {
         // 没有线程在加载，自己来加载
-        bp->busy = BP_BUSY;
+        bp->busy = true;
         lock_release(&bp->lock);
         
         struct frame* f = frame_alloc();
@@ -343,8 +340,8 @@ bp_load_locked(struct backing_page *bp) {
 
         lock_acquire(&bp->lock);
         bp->frame = f;
-        bp->status = BP_LOADED;
-        bp->busy = BP_NOT_BUSY;
+        bp->loc = BP_LOC_FRAME;
+        bp->busy = false;
         cond_broadcast(&bp->busy_cond, &bp->lock);
         return true;
         
@@ -353,13 +350,13 @@ bp_load_locked(struct backing_page *bp) {
         
     fail1:
         lock_acquire(&bp->lock);
-        bp->busy = BP_NOT_BUSY;
-        bp->status = BP_FAILED;
+        // bp->loc = BP_LOC_FAILED; 加载失败loc不变
+        bp->busy = false;
         cond_broadcast(&bp->busy_cond, &bp->lock);
         return false;
     }
     else {
-        PANIC("Invalid bp status in bp_load_locked: %d", bp->status);
+        PANIC("Invalid bp location in bp_load_locked: %d", bp->loc);
     }
 }
 
@@ -367,7 +364,7 @@ bp_load_locked(struct backing_page *bp) {
 bool
 bp_claim_locked(struct backing_page *bp, struct spte *spte) {
 
-    if (pmap_is_mmaped(spte)) {
+    if (pmap_check_spte_mmaped(spte)) {
         return true;
     } 
 
@@ -400,7 +397,7 @@ bp_collect_accessed_locked(struct backing_page *bp, bool clear) {
         struct spte *spte = list_entry(e, struct spte, bp_elem);
         accessed |= pmap_test_spte_accessed(spte, clear);
     }
-    bp->accessed = clear ? false : bp->accessed; 
+    bp->accessed = clear ? false : accessed; 
     return accessed;
 }
 
@@ -412,7 +409,7 @@ bp_collect_dirty_locked(struct backing_page *bp, bool clear) {
         struct spte *spte = list_entry(e, struct spte, bp_elem);
         dirty |= pmap_test_spte_dirty(spte, clear); 
     }
-    bp->dirty = clear ? false : bp->dirty;
+    bp->dirty = clear ? false : dirty;
     return dirty;
 }
 
