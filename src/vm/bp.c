@@ -1,13 +1,12 @@
 
 #include <string.h>
-#include "threads/thread.h"
 #include "threads/malloc.h"
 #include "threads/vaddr.h"
-#include "userprog/pagedir.h"
 #include "vm/bp.h"
 #include "vm/page.h"
 #include "vm/frame.h"
 #include "vm/swap.h"
+#include "vm/pmap.h"
 #include "filesys/inode.h"
 #include "filesys/file.h"
 
@@ -26,12 +25,6 @@ static bool bp_load_locked(struct backing_page *bp);
 static bool bp_claim_locked(struct backing_page *bp, struct spte *spte);
 
 static void bp_clear_pages_locked(struct backing_page *bp);
-
-static uint32_t *bp_get_spte_pagedir(struct spte *spte);
-static bool bp_test_spte_accessed(struct spte *spte, bool clear);
-static bool bp_test_spte_dirty(struct spte *spte, bool clear);
-static void bp_clear_spte_page(struct spte *spte);
-static bool bp_install_spte_page(struct spte *spte, void *kpage);
 
 // 实际上private+COW也算是一种共享
 
@@ -142,9 +135,9 @@ bp_attach(struct backing_page *bp, struct spte *spte) {
 void 
 bp_detach(struct backing_page *bp, struct spte *spte) {
     lock_acquire(&bp->lock);
-    bp->accessed |= bp_test_spte_accessed(spte, false);
-    bp->dirty |= bp_test_spte_dirty(spte, false);
-    bp_clear_spte_page(spte); 
+    bp->accessed |= pmap_test_spte_accessed(spte, false);
+    bp->dirty |= pmap_test_spte_dirty(spte, false);
+    pmap_clear_spte_page(spte); 
     list_remove(&spte->bp_elem);
     lock_release(&bp->lock);
 
@@ -373,9 +366,8 @@ bp_load_locked(struct backing_page *bp) {
 // 返回成功说明bp已经resident了
 bool
 bp_claim_locked(struct backing_page *bp, struct spte *spte) {
-    uint32_t *pagedir = bp_get_spte_pagedir(spte);
 
-    if (pagedir_get_page(pagedir, spte->upage) != NULL) {
+    if (pmap_is_mmaped(spte)) {
         return true;
     } 
 
@@ -383,7 +375,7 @@ bp_claim_locked(struct backing_page *bp, struct spte *spte) {
         return false;
     }
         
-    if (!bp_install_spte_page(spte, bp->frame->kpage)) {
+    if (!pmap_install_spte_page(spte, bp->frame->kpage)) {
         return false;
     }
     // 分配页表也可能失败，所以要判断
@@ -406,7 +398,7 @@ bp_collect_accessed_locked(struct backing_page *bp, bool clear) {
     bool accessed = bp->accessed;
      for (e = list_begin(&bp->sharers); e != list_end(&bp->sharers); e = list_next(e)) {
         struct spte *spte = list_entry(e, struct spte, bp_elem);
-        accessed |= bp_test_spte_accessed(spte, clear);
+        accessed |= pmap_test_spte_accessed(spte, clear);
     }
     bp->accessed = clear ? false : bp->accessed; 
     return accessed;
@@ -418,7 +410,7 @@ bp_collect_dirty_locked(struct backing_page *bp, bool clear) {
     bool dirty = bp->dirty;
     for (e = list_begin(&bp->sharers); e != list_end(&bp->sharers); e = list_next(e)) {
         struct spte *spte = list_entry(e, struct spte, bp_elem);
-        dirty |= bp_test_spte_dirty(spte, clear); 
+        dirty |= pmap_test_spte_dirty(spte, clear); 
     }
     bp->dirty = clear ? false : bp->dirty;
     return dirty;
@@ -429,52 +421,6 @@ bp_clear_pages_locked(struct backing_page *bp) {
     struct list_elem *e;
     for (e = list_begin(&bp->sharers); e != list_end(&bp->sharers); e = list_next(e)) {
         struct spte *spte = list_entry(e, struct spte, bp_elem);
-        bp_clear_spte_page(spte);
+        pmap_clear_spte_page(spte);
     }
-}
-
-/* ----------- bp访问spte页表 ----------- */
-// 页表存在项要和bp->status同步
-// used by bp
-static uint32_t *
-bp_get_spte_pagedir(struct spte *spte) {
-    // 只有插入spt中的spte才能和bp绑定
-    // 绑定意味着bp和pagedir绑定
-    ASSERT(spte->owner != NULL);
-    struct spt *owner = spte->owner;
-    ASSERT(owner->owner != NULL);
-    struct thread *owner_thread = owner->owner;
-    return owner_thread->pagedir;
-}
-
-static bool
-bp_test_spte_accessed(struct spte *spte, bool clear) {
-    uint32_t *pagedir = bp_get_spte_pagedir(spte);
-    bool accessed = pagedir_is_accessed(pagedir, spte->upage);
-    if (clear) {
-        pagedir_set_accessed(pagedir, spte->upage, false);
-    }
-    return accessed;
-}
-
-static bool
-bp_test_spte_dirty(struct spte *spte, bool clear) {
-    uint32_t *pagedir = bp_get_spte_pagedir(spte);
-    bool dirty = pagedir_is_dirty(pagedir, spte->upage);
-    if (clear) {
-        pagedir_set_dirty(pagedir, spte->upage, false);
-    }
-    return dirty;
-}
-
-static void
-bp_clear_spte_page(struct spte *spte) {
-    uint32_t *pagedir = bp_get_spte_pagedir(spte);
-    pagedir_clear_page(pagedir, spte->upage);
-}
-
-static bool
-bp_install_spte_page(struct spte *spte, void *kpage) {
-    uint32_t *pagedir = bp_get_spte_pagedir(spte);
-    return pagedir_set_page(pagedir, spte->upage, kpage, spte->writable);
 }
