@@ -31,7 +31,7 @@ static uint32_t *bp_get_spte_pagedir(struct spte *spte);
 static bool bp_test_spte_accessed(struct spte *spte, bool clear);
 static bool bp_test_spte_dirty(struct spte *spte, bool clear);
 static void bp_clear_spte_page(struct spte *spte);
-static void bp_install_spte_page(struct spte *spte, void *kpage);
+static bool bp_install_spte_page(struct spte *spte, void *kpage);
 
 // 实际上private+COW也算是一种共享
 
@@ -383,7 +383,9 @@ bp_claim_locked(struct backing_page *bp, struct spte *spte) {
         return false;
     }
         
-    bp_install_spte_page(spte, bp->frame->kpage);// 这里可能可以直接调用pagedir_set?
+    if (!bp_install_spte_page(spte, bp->frame->kpage)) {
+        return false;
+    }
     // 分配页表也可能失败，所以要判断
     // 失败后，即使bp已经装载，也不用回滚，此时页表与bp状态相当于spt未访问
 
@@ -471,8 +473,8 @@ bp_clear_spte_page(struct spte *spte) {
     pagedir_clear_page(pagedir, spte->upage);
 }
 
-static void
+static bool
 bp_install_spte_page(struct spte *spte, void *kpage) {
     uint32_t *pagedir = bp_get_spte_pagedir(spte);
-    pagedir_set_page(pagedir, spte->upage, kpage, spte->writable);
+    return pagedir_set_page(pagedir, spte->upage, kpage, spte->writable);
 }
