@@ -195,7 +195,13 @@ bp_page_in(struct backing_page *bp, struct frame *f) {
         off_t read_byte = inode_read_at(fi->inode_ptr, f->kpage, 
                                     fi->read_bytes, fi->offset);
         memset(f->kpage + fi->read_bytes, 0, fi->zero_bytes);
-        return read_byte == fi->read_bytes;
+        bool success = read_byte == fi->read_bytes;
+        // cow后删除这里
+        if (success && !bp->shared) {
+            // 私有file页，加载后变为anon，不写回也不参与共享
+            bp->kind = BP_KIND_ANON;
+        }
+        return success;
     }
     else if (bp->loc == BP_LOC_SWAP) {
         swap_slot_t slot = bp->slot;
