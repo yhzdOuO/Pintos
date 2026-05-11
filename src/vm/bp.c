@@ -18,17 +18,22 @@ static struct shared_backing_page {
 
 static unsigned file_source_hash_func(const struct hash_elem *e, void *aux UNUSED);
 static bool file_source_less_func(const struct hash_elem *a, const struct hash_elem *b, void *aux UNUSED);
-static bool bp_page_in(struct backing_page *bp, struct frame *f);
-static void bp_write_back_locked(struct backing_page *bp);
+
+static bool bp_page_in_locked(struct backing_page *bp, struct frame *f);
+static bool bp_page_out_locked(struct backing_page *bp);
+static bool bp_page_destroy_locked(struct backing_page *bp);
 
 static bool bp_load_locked(struct backing_page *bp);
-static bool bp_claim_locked(struct backing_page *bp, struct spte *spte);
+// bool bp_claim_page(struct backing_page *bp, struct spte *spte); --- IGNORE ---
+
+// bool bp_evict_locked(struct backing_page *bp); --- IGNORE ---
+
+static bool bp_free_up(struct backing_page *bp);
+// bp_detatch
 
 static void bp_clear_pages_locked(struct backing_page *bp);
 
 // 实际上private+COW也算是一种共享
-
-
 
 void 
 backing_page_init(void) {
@@ -154,10 +159,7 @@ bp_detach(struct backing_page *bp, struct spte *spte) {
     }
 
     if (should_free_bp) {
-        lock_acquire(&bp->lock);
-        bp_write_back_locked(bp);
-        lock_release(&bp->lock);
-        free(bp);
+        bp_free_up(bp);
     }
 }
 
@@ -186,117 +188,119 @@ file_source_less_func(const struct hash_elem *a, const struct hash_elem *b,
     return fi_a->zero_bytes < fi_b->zero_bytes;
 }
 
-static bool 
-bp_page_in(struct backing_page *bp, struct frame *f) {
-    lock_acquire(&bp->lock);
+static bool
+bp_file_page_in (struct inode *inode_ptr, off_t offset, void *kpage, off_t read_bytes, off_t zero_bytes) {
+    off_t bytes = inode_read_at(inode_ptr, kpage, read_bytes, offset);
+    memset(kpage + read_bytes, 0, zero_bytes);
+    return bytes == read_bytes;
+}
+
+static bool
+bp_file_page_out(struct inode *inode_ptr, off_t offset, void *kpage, off_t written_bytes) {
+    off_t bytes = inode_write_at(inode_ptr, kpage, written_bytes, offset);
+    return bytes == written_bytes;
+}
+
+static bool
+bp_swap_page_in(swap_slot_t slot, void *kpage) {
+    swap_read_page(slot, kpage);
+    swap_free_slot(slot);
+    return true;
+}
+
+static bool
+bp_swap_page_out(swap_slot_t slot, void *kpage) {
+    swap_write_page(slot, kpage);
+    return true;
+}
+
+static bool
+bp_swap_page_destroy(swap_slot_t slot) {
+    swap_free_slot(slot);
+    return true;
+}
+
+static bool
+bp_zero_page_in(void *kpage) {
+    memset(kpage, 0, PGSIZE);
+    return true;
+}
+
+static bool
+bp_page_in_locked(struct backing_page *bp, struct frame *f) {
+    // page in 只是把page装进来，判断要不要装不是它做的事情
+    ASSERT(lock_held_by_current_thread(&bp->lock));
+    ASSERT(bp->busy); 
+    
+    bool success = false;
     if (bp->loc == BP_LOC_FILE) {
-        lock_release(&bp->lock);
         const struct file_info *fi = &bp->origin_info.file;
-        off_t read_byte = inode_read_at(fi->inode_ptr, f->kpage, 
-                                    fi->read_bytes, fi->offset);
-        memset(f->kpage + fi->read_bytes, 0, fi->zero_bytes);
-        bool success = read_byte == fi->read_bytes;
-        // cow后删除这里
+        lock_release(&bp->lock);
+        success = bp_file_page_in(fi->inode_ptr, fi->offset, f->kpage, 
+                        fi->read_bytes, fi->zero_bytes);
+        lock_acquire(&bp->lock);
         if (success && !bp->shared) {
             // 私有file页，加载后变为anon，不写回也不参与共享
             bp->kind = BP_KIND_ANON;
         }
-        return success;
     }
     else if (bp->loc == BP_LOC_SWAP) {
         swap_slot_t slot = bp->slot;
         lock_release(&bp->lock);
-        swap_read_page(slot, f->kpage);
-        swap_free_slot(slot);
-        return true;
+        success = bp_swap_page_in(slot, f->kpage);
+        lock_acquire(&bp->lock);
+        if (success) {
+            bp->slot = SLOT_ERROR;
+        }
     }
     else if (bp->loc == BP_LOC_ZERO) {
         lock_release(&bp->lock);
-        memset(f->kpage, 0, PGSIZE);
-        return true;
+        success = bp_zero_page_in(f->kpage);
+        lock_acquire(&bp->lock);
+    }
+    else if (bp->loc == BP_LOC_FRAME) {
+        PANIC("bp_page_in should not be called when bp is already resident");
     }
     else {
-        lock_release(&bp->lock);
         PANIC("Invalid bp location in bp_page_in: %d", bp->loc);
     }
+
+    if (success) {
+        bp->frame = f;
+        bp->loc = BP_LOC_FRAME;
+    }
+    return success;
 }
 
-static void 
-bp_write_back_locked(struct backing_page *bp) {
-    while(bp->busy) {
-        cond_wait(&bp->busy_cond, &bp->lock);
-    }
-    bp->busy = true; // 保持busy直到free，防止frame的访问（frame不访问busy状态的bp）
+static bool
+bp_page_out_locked(struct backing_page *bp) {    
+    ASSERT(lock_held_by_current_thread(&bp->lock));
+    ASSERT(bp->busy); 
+    ASSERT(bp->loc == BP_LOC_FRAME);
     
-    if (bp->loc == BP_LOC_FRAME) {
-        if (bp->kind == BP_KIND_FILE) {
-            if (bp_collect_dirty_locked(bp, false)) {
-                const struct file_info *fi = &bp->origin_info.file;
-                void *kpage = bp->frame->kpage;
-                lock_release(&bp->lock);
-                off_t written_bytes = inode_write_at(fi->inode_ptr, kpage, 
-                                                    fi->read_bytes, fi->offset);
-                if (written_bytes != fi->read_bytes) {
-                    PANIC("Failed to write back dirty page to file during bp_free. \n"
-                        "Written bytes: %d, expected: %d", written_bytes, fi->read_bytes);
-                }
-                lock_acquire(&bp->lock);
-            }
-        }
-        else if (bp->kind == BP_KIND_ANON) {
-            // 不做任何事
-        }
-        lock_release(&bp->lock);
-        frame_free(bp->frame);
-        lock_acquire(&bp->lock);
-        bp->frame = NULL;
-    }
-    else if (bp->loc == BP_LOC_SWAP) {
-        lock_release(&bp->lock);
-        swap_free_slot(bp->slot);
-        lock_acquire(&bp->lock);
-        bp->slot = SLOT_ERROR;
-    }
-    else if (bp->loc == BP_LOC_ZERO || bp->loc == BP_LOC_FILE) {
-        // 没有加载到内存，不需要做任何事
-    }
-}
-
-// 只有frame会调用这个函数
-// frame保证不会同时有多个线程逐出bp，frame释放锁的时候，frame结构体已经移出全局frame表了，所以不会有新的线程拿到这个frame来逐出同一个bp了
-// 也不会加载和逐出同时发生，因为frame分配的页会先pin住，等装载完再unpin，不会装载的时候被逐出
-bool 
-bp_evict_locked(struct backing_page *bp) {
-    ASSERT(bp->loc == BP_LOC_FRAME); // 只有加载完成的页才会被逐出
-    ASSERT(!bp->busy); // 逐出前应该没有线程在加载这个页了
-    bp->busy = true;
-
     bool success = false;
-    // start evicting the page
     if (bp->kind == BP_KIND_FILE) {
-        if (!bp_collect_dirty_locked(bp, false)) {
-            success = true; // 没有被修改过，不需要写回，直接当作写回成功了
-        }
-        else {
+        if (bp_collect_dirty_locked(bp, false)) {
+            const struct file_info *fi = &bp->origin_info.file;
             void *kpage = bp->frame->kpage;
             lock_release(&bp->lock);
-            const struct file_info *fi = &bp->origin_info.file;
-            off_t written_bytes = inode_write_at(fi->inode_ptr, kpage, 
-                                                fi->read_bytes, fi->offset);
-            success = written_bytes == fi->read_bytes;
+            success = bp_file_page_out(fi->inode_ptr, fi->offset, kpage, fi->read_bytes);
             lock_acquire(&bp->lock);
         }
+        else {
+            success = true; // 没有被修改过，不需要写回，直接当作写回成功了
+        }
+
         if (success) {
             bp->loc = BP_LOC_FILE;
-            // 不用清理，因为全部重置了
         }
     }
     else if (bp->kind == BP_KIND_ANON) {
+        void *kpage = bp->frame->kpage;
         lock_release(&bp->lock);
         swap_slot_t slot = swap_alloc_slot();
-        success = slot != SLOT_ERROR;
-        if (success) {
-            swap_write_page(slot, bp->frame->kpage);
+        if (slot != SLOT_ERROR) {
+            success = bp_swap_page_out(slot, kpage);
         }
         lock_acquire(&bp->lock);
         if (success) {
@@ -305,22 +309,78 @@ bp_evict_locked(struct backing_page *bp) {
         }
     }
     else {
-        PANIC("Invalid bp kind in bp_evict: %d", bp->kind);
+        PANIC("Invalid bp kind in bp_page_out: %d", bp->kind);
     }
-    // evicting done, update bp status
 
     if (success) {
         bp->frame = NULL;
-        bp_clear_pages_locked(bp); // 同步页表，同时也清除页表的A和D位
-        bp->accessed = bp->dirty = false; // 重置访问和修改状态
     }
-    bp->busy = false;
-    cond_broadcast(&bp->busy_cond, &bp->lock);
+    return success;
+}
+
+static bool
+bp_page_destroy_locked(struct backing_page *bp) {
+    ASSERT(lock_held_by_current_thread(&bp->lock));
+    ASSERT(bp->busy); 
+    
+    bool success = false;
+    if (bp->loc == BP_LOC_FRAME) {
+        if (bp->kind == BP_KIND_FILE) {
+            if (bp_collect_dirty_locked(bp, false)) {
+                const struct file_info *fi = &bp->origin_info.file;
+                void *kpage = bp->frame->kpage;
+                lock_release(&bp->lock);
+                bool success = bp_file_page_out(fi->inode_ptr, fi->offset, kpage, fi->read_bytes);
+                lock_acquire(&bp->lock);
+                if (!success) {
+                    PANIC("Failed to write back dirty page to file during bp_page_destroy_locked. \n"
+                        "Written bytes may be less than expected");
+                }
+            }
+            else {
+                success = true;
+            }
+        }
+        else if (bp->kind == BP_KIND_ANON) {
+            // do nothing
+            success = true;
+        }
+        else {
+            PANIC("Invalid bp kind in bp_page_destroy_locked: %d", bp->kind);
+        }
+        lock_release(&bp->lock);
+        frame_free(bp->frame);
+        lock_acquire(&bp->lock);
+        bp->frame = NULL;
+    }
+    else if (bp->loc == BP_LOC_SWAP) {
+        swap_slot_t slot = bp->slot;
+        lock_release(&bp->lock);
+        success = bp_swap_page_destroy(slot);
+        lock_acquire(&bp->lock);
+        if (success) {
+            bp->slot = SLOT_ERROR;
+        }
+        else {
+            PANIC("Failed to free swap slot during bp_page_destroy_locked. \n"
+                "This may cause swap space leak.");
+        }
+    }
+    else if (bp->loc == BP_LOC_ZERO || bp->loc == BP_LOC_FILE) {
+        // 没有加载到内存，不需要做任何事
+        return true;
+    }
+    else {
+        PANIC("Invalid bp location in bp_page_destroy_locked: %d", bp->loc);
+    }
+    // 不可能写回失败，失败必须panic
     return success;
 }
 
 static bool 
 bp_load_locked(struct backing_page *bp) {
+    ASSERT(lock_held_by_current_thread(&bp->lock));
+
     while (bp->busy) {
         cond_wait(&bp->busy_cond, &bp->lock);
     }
@@ -334,32 +394,24 @@ bp_load_locked(struct backing_page *bp) {
         bp->busy = true;
         lock_release(&bp->lock);
         
+        bool success = false;
         struct frame* f = frame_alloc();
-        if (f == NULL) {
-            goto fail1;
+        if (f != NULL) {
+            lock_acquire(&bp->lock);
+            success = bp_page_in_locked(bp, f);
+            lock_release(&bp->lock);
+            if (success) {
+                frame_register(f, bp); // 双向引用
+                frame_unpin(f); //刚分配的frame是pin住的，装载完就可以unpin了
+            }
+            else {
+                frame_free(f);
+            }
         }
-        if (!bp_page_in(bp, f)) {
-            goto fail2;
-        }
-        frame_register(f, bp); // 双向引用
-        frame_unpin(f); // 刚分配的frame是pin住的，装载完就可以unpin了
-
         lock_acquire(&bp->lock);
-        bp->frame = f;
-        bp->loc = BP_LOC_FRAME;
         bp->busy = false;
         cond_broadcast(&bp->busy_cond, &bp->lock);
-        return true;
-        
-    fail2:
-        frame_free(f);
-        
-    fail1:
-        lock_acquire(&bp->lock);
-        // bp->loc = BP_LOC_FAILED; 加载失败loc不变
-        bp->busy = false;
-        cond_broadcast(&bp->busy_cond, &bp->lock);
-        return false;
+        return success;
     }
     else {
         PANIC("Invalid bp location in bp_load_locked: %d", bp->loc);
@@ -368,29 +420,65 @@ bp_load_locked(struct backing_page *bp) {
 
 // 返回成功说明bp已经resident了
 bool
-bp_claim_locked(struct backing_page *bp, struct spte *spte) {
+bp_claim_page(struct backing_page *bp, struct spte *spte) {
 
+    lock_acquire(&bp->lock);
+    // 先查页表
+    bool success = false;
     if (pmap_check_spte_mmaped(spte)) {
-        return true;
+        success = true;
+        goto DONE;
     } 
 
     if (!bp_load_locked(bp)) {
-        return false;
+        success = false;
+        goto DONE;
     }
         
     if (!pmap_install_spte_page(spte, bp->frame->kpage)) {
-        return false;
+        success = false;
+        goto DONE;
     }
     // 分配页表也可能失败，所以要判断
     // 失败后，即使bp已经装载，也不用回滚，此时页表与bp状态相当于spt未访问
+    success = true;
 
-    return true;
+DONE:
+    lock_release(&bp->lock);
+    return success;
 }
 
-bool bp_claim_page(struct backing_page *bp, struct spte *spte) {
+// 只有frame会调用这个函数
+// frame保证不会同时有多个线程逐出bp，frame释放锁的时候，frame结构体已经移出全局frame表了，所以不会有新的线程拿到这个frame来逐出同一个bp了
+// 也不会加载和逐出同时发生，因为frame分配的页会先pin住，等装载完再unpin，不会装载的时候被逐出
+bool 
+bp_try_evict_locked(struct backing_page *bp) {
+    ASSERT(lock_held_by_current_thread(&bp->lock));
+    ASSERT(bp->loc == BP_LOC_FRAME); // 只有加载完成的页才会被逐出
+    ASSERT(!bp->busy); // 逐出前应该没有线程在加载这个页了
+    bp->busy = true;
+    bool success = bp_page_out_locked(bp);
+    if (success) {
+        bp_clear_pages_locked(bp); // 同步页表，同时也清除页表的A和D位
+        bp->accessed = bp->dirty = false; // 重置访问和修改状态
+    }
+    bp->busy = false;
+    cond_broadcast(&bp->busy_cond, &bp->lock);
+    return success;
+}
+
+static bool
+bp_free_up(struct backing_page *bp) {
     lock_acquire(&bp->lock);
-    bool success = bp_claim_locked(bp, spte);
+    while (bp->busy) {
+        cond_wait(&bp->busy_cond, &bp->lock);
+    }
+    bp->busy = true; // 防止frame操作
+    bool success = bp_page_destroy_locked(bp);
+    bp->busy = false;
+    cond_broadcast(&bp->busy_cond, &bp->lock); // 感觉没必要
     lock_release(&bp->lock);
+    free(bp);
     return success;
 }
 

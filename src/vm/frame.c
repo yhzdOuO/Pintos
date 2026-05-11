@@ -150,8 +150,10 @@ clock_try_evict(struct frame *f, bool clock_first_time) {
         lock_release(&bp->lock);
         return false; 
     }
-    bool success = bp_evict_locked(bp);
-    f->bp = NULL;
+    bool success = bp_try_evict_locked(bp);
+    if (success) {
+        f->bp = NULL;
+    }
     lock_release(&bp->lock);
     return success;
 }

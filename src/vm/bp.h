@@ -65,7 +65,7 @@ void bp_detach(struct backing_page *bp, struct spte *spte);
 bool bp_claim_page(struct backing_page *bp, struct spte *spte); 
 
 // used by frame.c
-bool bp_evict_locked(struct backing_page *bp);
+bool bp_try_evict_locked(struct backing_page *bp);
 bool bp_collect_accessed_locked(struct backing_page *bp, bool clear);
 bool bp_collect_dirty_locked(struct backing_page *bp, bool clear);
 
