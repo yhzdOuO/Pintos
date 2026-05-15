@@ -41,36 +41,20 @@ backing_page_init(void) {
     hash_init(&shared_file_bps.file_bps, file_source_hash_func, file_source_less_func, NULL);
 }
 
-static void
-bp_init_file(struct backing_page *bp, struct spte_desc *desc) {
-    bp->kind = BP_KIND_FILE;
-    bp->loc = BP_LOC_FILE;
-
-    bp->shared = (desc->sharing == SPTE_SHARED);
-    bp->busy = false;
-    bp->accessed = bp->dirty = false;
-
-    lock_init(&bp->lock);
-    list_init(&bp->sharers);
-    cond_init(&bp->busy_cond);
-
-    bp->frame = NULL;
-    bp->slot = SLOT_ERROR;
-
-    bp->file_ref_cnt = 1;
-
+static void 
+bp_init_file_share(struct backing_page *bp, struct spte_desc *desc) {
     bp->origin_info.file.inode_ptr = file_get_inode(desc->file);
     bp->origin_info.file.offset = desc->offset;
     bp->origin_info.file.read_bytes = desc->read_bytes;
     bp->origin_info.file.zero_bytes = desc->zero_bytes;
 }
 
-static void 
-bp_init_zero(struct backing_page *bp, struct spte_desc *desc) {
-    bp->kind = BP_KIND_ANON;
-    bp->loc = BP_LOC_ZERO;
+static void
+bp_init_struct(struct backing_page *bp, enum bp_kind kind, enum bp_location loc, bool shared) {
+    bp->kind = kind;
+    bp->loc = loc;
 
-    bp->shared = false;
+    bp->shared = shared;
     bp->busy = false;
     bp->accessed = bp->dirty = false;
     
@@ -80,8 +64,8 @@ bp_init_zero(struct backing_page *bp, struct spte_desc *desc) {
     
     bp->frame = NULL;
     bp->slot = SLOT_ERROR;
-    
-    bp->file_ref_cnt = 1;
+
+    bp->ref_cnt = 1;
 }
 
 struct backing_page *
@@ -91,22 +75,26 @@ bp_get_file(struct spte_desc *desc) {
         return NULL;
     }
     
-    bp_init_file(bp, desc);
+    bp_init_file_share(bp, desc); 
+    bool shared = desc->sharing == SPTE_SHARED;
 
-    if (bp->shared) {
+    if (shared) {
         lock_acquire(&shared_file_bps.lock);
         // 先查全局共享缓存
         struct hash_elem *e = hash_find(&shared_file_bps.file_bps, &bp->cache_elem);
         if (e != NULL) {
             free(bp);
             bp = hash_entry(e, struct backing_page, cache_elem);
-            bp->file_ref_cnt++;
+            bp->ref_cnt++;
         }
         else {
+            bp_init_struct(bp, BP_KIND_FILE, BP_LOC_FILE, true);
             hash_insert(&shared_file_bps.file_bps, &bp->cache_elem);
-            bp->file_ref_cnt = 1;
         }
         lock_release(&shared_file_bps.lock);
+    }
+    else {
+        bp_init_struct(bp, BP_KIND_FILE, BP_LOC_FILE, false);
     }
 
     return bp;
@@ -121,7 +109,7 @@ bp_get_anon(struct spte_desc *desc) {
     
     ASSERT(desc->sharing == SPTE_PRIVATE); // zero page 目前只支持 private
 
-    bp_init_zero(bp, desc);
+    bp_init_struct(bp, BP_KIND_ANON, BP_LOC_ZERO, false);
     return bp;
 }
 
@@ -144,16 +132,16 @@ bp_detach(struct backing_page *bp, struct spte *spte) {
     bool should_free_bp = false;
     if (bp->kind == BP_KIND_FILE && bp->shared) {
         lock_acquire(&shared_file_bps.lock);
-        bp->file_ref_cnt--;
-        if (bp->file_ref_cnt == 0) {
+        bp->ref_cnt--;
+        if (bp->ref_cnt == 0) {
             hash_delete(&shared_file_bps.file_bps, &bp->cache_elem);
             should_free_bp = true;
         }
         lock_release(&shared_file_bps.lock);
     }
     else {
-        bp->file_ref_cnt--;
-        if (bp->file_ref_cnt == 0) {
+        bp->ref_cnt--;
+        if (bp->ref_cnt == 0) {
             should_free_bp = true;
         }
     }

@@ -39,7 +39,7 @@ struct backing_page {
     swap_slot_t slot;             // 仅 store == BP_STORE_SWAP 时有效
     
 
-    size_t file_ref_cnt;           // 由shared_file_bps保护，只有shared_file_bps的函数才能修改下面两个字段的值
+    size_t ref_cnt;           // 由shared_file_bps保护，只有shared_file_bps的函数才能修改下面两个字段的值
     struct hash_elem cache_elem;   // in shared_file_bps.file_bps
 
     union {
